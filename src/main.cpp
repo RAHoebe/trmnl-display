@@ -201,21 +201,17 @@ int32_t seekPng(PNGFILE *file, int32_t position) {
 // updated only after the PNG passes validation, so a bad image leaves it intact.
 uint8_t shades[PanelWidth * PanelHeight / 2];
 
-struct ImageFit {
+struct PanelScaler {
     PNG &png;
     int sourceWidth;
     int sourceHeight;
-    int width;
-    int height;
     int sourceRows = 0;
     int outputRows = 0;
     uint16_t rgb[MaxPngDimension];
     uint32_t sums[PanelWidth]{};
 
-    ImageFit(PNG &decoder, int sourceW, int sourceH)
-        : png(decoder), sourceWidth(sourceW), sourceHeight(sourceH),
-          width(min(PanelWidth, max(1, PanelHeight * sourceW / sourceH))),
-          height(min(PanelHeight, max(1, PanelWidth * sourceH / sourceW))) {}
+    PanelScaler(PNG &decoder, int width, int height)
+        : png(decoder), sourceWidth(width), sourceHeight(height) {}
 };
 
 unsigned luma(uint16_t pixel) {
@@ -233,49 +229,53 @@ unsigned graySample(const PNGDRAW &row, int column) {
 }
 
 int makeScaledRow(PNGDRAW *row) {
-    auto &fit = *static_cast<ImageFit *>(row->pUser);
-    if (row->iWidth != fit.sourceWidth || row->y != fit.sourceRows ||
-        row->y >= fit.sourceHeight || fit.outputRows >= fit.height) return 0;
+    auto &scaler = *static_cast<PanelScaler *>(row->pUser);
+    if (row->iWidth != scaler.sourceWidth || row->y != scaler.sourceRows ||
+        row->y >= scaler.sourceHeight || scaler.outputRows >= PanelHeight) return 0;
 
     const bool gray = row->iPixelType == PNG_PIXEL_GRAYSCALE;
     if (gray) {
         if (row->iBpp != 1 && row->iBpp != 2 && row->iBpp != 4 && row->iBpp != 8) return 0;
     } else {
-        fit.png.getLineAsRGB565(row, fit.rgb, PNG_RGB565_LITTLE_ENDIAN, 0xFFFFFF);
+        scaler.png.getLineAsRGB565(row, scaler.rgb, PNG_RGB565_LITTLE_ENDIAN, 0xFFFFFF);
     }
-    const int xOrigin = (PanelWidth - fit.width) / 2;
-    const int yOrigin = (PanelHeight - fit.height) / 2;
-    const int dy = fit.outputRows;
-    const int yStart = dy * fit.sourceHeight / fit.height;
-    const int yEnd = max(yStart + 1, (dy + 1) * fit.sourceHeight / fit.height);
 
-    for (int x = 0; x < fit.width; ++x) {
-        const int start = x * fit.sourceWidth / fit.width;
-        const int end = max(start + 1, (x + 1) * fit.sourceWidth / fit.width);
-        for (int sx = start; sx < end; ++sx) {
-            fit.sums[x] += gray ? graySample(*row, sx) : luma(fit.rgb[sx]);
+    // Weight each source pixel by its overlap with the target pixel. This
+    // keeps thin strokes even when a pixel spans a fractional number of samples.
+    uint8_t scaledRow[PanelWidth];
+    for (int x = 0; x < PanelWidth; ++x) {
+        const int left = x * scaler.sourceWidth;
+        const int right = left + scaler.sourceWidth;
+        unsigned sum = 0;
+        for (int sx = left / PanelWidth; sx <= (right - 1) / PanelWidth; ++sx) {
+            const int pixelLeft = sx * PanelWidth;
+            const int weight = min(right, pixelLeft + PanelWidth) - max(left, pixelLeft);
+            const unsigned shade = gray ? graySample(*row, sx) : luma(scaler.rgb[sx]);
+            sum += shade * weight;
         }
+        scaledRow[x] = (sum + scaler.sourceWidth / 2) / scaler.sourceWidth;
     }
 
-    // Downsampling combines several source rows. Upsampling may finish several
-    // output rows for this source row and gives each the same pixel values.
-    if (row->y + 1 == yEnd) {
-        do {
-            uint8_t *output = shades + (yOrigin + fit.outputRows) * (PanelWidth / 2);
-            for (int x = 0; x < fit.width; ++x) {
-                const int start = x * fit.sourceWidth / fit.width;
-                const int end = max(start + 1, (x + 1) * fit.sourceWidth / fit.width);
-                const unsigned count = (end - start) * (yEnd - yStart);
-                const unsigned shade = (fit.sums[x] + count * 8) / (count * 17);
-                const int column = xOrigin + x;
-                output[column / 2] |= shade << ((column & 1) ? 0 : 4);
-            }
-            ++fit.outputRows;
-        } while (fit.sourceHeight < fit.height && fit.outputRows < fit.height &&
-                 fit.outputRows * fit.sourceHeight / fit.height == row->y);
-        memset(fit.sums, 0, sizeof(fit.sums));
+    const int sourceTop = row->y * PanelHeight;
+    const int sourceBottom = sourceTop + PanelHeight;
+    while (scaler.outputRows * scaler.sourceHeight < sourceBottom) {
+        const int top = scaler.outputRows * scaler.sourceHeight;
+        const int bottom = top + scaler.sourceHeight;
+        const int weight = min(bottom, sourceBottom) - max(top, sourceTop);
+        for (int x = 0; x < PanelWidth; ++x) scaler.sums[x] += scaledRow[x] * weight;
+        if (bottom > sourceBottom) break;
+
+        uint8_t *output = shades + scaler.outputRows * (PanelWidth / 2);
+        const unsigned step = 17 * scaler.sourceHeight;
+        for (int x = 0; x < PanelWidth; x += 2) {
+            const unsigned high = (scaler.sums[x] + step / 2) / step;
+            const unsigned low = (scaler.sums[x + 1] + step / 2) / step;
+            output[x / 2] = (high << 4) | low;
+        }
+        memset(scaler.sums, 0, sizeof(scaler.sums));
+        ++scaler.outputRows;
     }
-    ++fit.sourceRows;
+    ++scaler.sourceRows;
     return 1;
 }
 
@@ -300,13 +300,12 @@ bool renderImage() {
         return false;
     }
 
-    memset(shades, 0, sizeof(shades));
-    ImageFit fit(*png, width, height);
-    const int decoded = png->decode(&fit, PNG_CHECK_CRC);
+    PanelScaler scaler(*png, width, height);
+    const int decoded = png->decode(&scaler, PNG_CHECK_CRC);
     png->close();
-    if (decoded != PNG_SUCCESS || fit.sourceRows != height || fit.outputRows != fit.height) {
+    if (decoded != PNG_SUCCESS || scaler.sourceRows != height || scaler.outputRows != PanelHeight) {
         Serial.printf("TRMNL PNG decode error %d (%d source rows, %d output rows)\n",
-                      decoded, fit.sourceRows, fit.outputRows);
+                      decoded, scaler.sourceRows, scaler.outputRows);
         return false;
     }
     png.reset();
@@ -330,7 +329,7 @@ bool renderImage() {
     display.endWrite();
     hasFrame = true;
     Serial.printf("TRMNL FRAME %dx%d -> %dx%d, pixels %08lx\n",
-                  width, height, fit.width, fit.height, static_cast<unsigned long>(fingerprint));
+                  width, height, PanelWidth, PanelHeight, static_cast<unsigned long>(fingerprint));
     return true;
 }
 
