@@ -205,13 +205,16 @@ struct PanelScaler {
     PNG &png;
     int sourceWidth;
     int sourceHeight;
+    int cropLeft;
+    int cropWidth;
+    uint16_t *rgb;
     int sourceRows = 0;
     int outputRows = 0;
-    uint16_t rgb[MaxPngDimension];
     uint32_t sums[PanelWidth]{};
 
-    PanelScaler(PNG &decoder, int width, int height)
-        : png(decoder), sourceWidth(width), sourceHeight(height) {}
+    PanelScaler(PNG &decoder, int width, int height, int left, int right, uint16_t *rowBuffer)
+        : png(decoder), sourceWidth(width), sourceHeight(height), cropLeft(left),
+          cropWidth(width - left - right), rgb(rowBuffer) {}
 };
 
 unsigned luma(uint16_t pixel) {
@@ -228,32 +231,71 @@ unsigned graySample(const PNGDRAW &row, int column) {
     return ((row.pPixels[bit / 8] >> (8 - bits - bit % 8)) & mask) * 255 / mask;
 }
 
+bool prepareRow(PNG &png, PNGDRAW *row, uint16_t *rgb) {
+    if (row->iPixelType == PNG_PIXEL_GRAYSCALE) {
+        return row->iBpp == 1 || row->iBpp == 2 || row->iBpp == 4 || row->iBpp == 8;
+    }
+    png.getLineAsRGB565(row, rgb, PNG_RGB565_LITTLE_ENDIAN, 0xFFFFFF);
+    return true;
+}
+
+unsigned sampleLuma(const PNGDRAW &row, const uint16_t *rgb, int column) {
+    return row.iPixelType == PNG_PIXEL_GRAYSCALE ? graySample(row, column) : luma(rgb[column]);
+}
+
+struct SideMargins {
+    PNG &png;
+    uint16_t *rgb;
+    int width;
+    int firstInk;
+    int pastLastInk = 0;
+    int rows = 0;
+
+    SideMargins(PNG &decoder, uint16_t *rowBuffer, int imageWidth)
+        : png(decoder), rgb(rowBuffer), width(imageWidth), firstInk(imageWidth) {}
+};
+
+int scanSideMargins(PNGDRAW *row) {
+    auto &margins = *static_cast<SideMargins *>(row->pUser);
+    if (row->iWidth != margins.width || row->y != margins.rows ||
+        !prepareRow(margins.png, row, margins.rgb)) return 0;
+
+    for (int x = 0; x < margins.firstInk; ++x) {
+        if (sampleLuma(*row, margins.rgb, x) < 255) {
+            margins.firstInk = x;
+            break;
+        }
+    }
+    for (int x = margins.width - 1; x >= margins.pastLastInk; --x) {
+        if (sampleLuma(*row, margins.rgb, x) < 255) {
+            margins.pastLastInk = x + 1;
+            break;
+        }
+    }
+    ++margins.rows;
+    return 1;
+}
+
 int makeScaledRow(PNGDRAW *row) {
     auto &scaler = *static_cast<PanelScaler *>(row->pUser);
     if (row->iWidth != scaler.sourceWidth || row->y != scaler.sourceRows ||
-        row->y >= scaler.sourceHeight || scaler.outputRows >= PanelHeight) return 0;
-
-    const bool gray = row->iPixelType == PNG_PIXEL_GRAYSCALE;
-    if (gray) {
-        if (row->iBpp != 1 && row->iBpp != 2 && row->iBpp != 4 && row->iBpp != 8) return 0;
-    } else {
-        scaler.png.getLineAsRGB565(row, scaler.rgb, PNG_RGB565_LITTLE_ENDIAN, 0xFFFFFF);
-    }
+        row->y >= scaler.sourceHeight || scaler.outputRows >= PanelHeight ||
+        !prepareRow(scaler.png, row, scaler.rgb)) return 0;
 
     // Weight each source pixel by its overlap with the target pixel. This
     // keeps thin strokes even when a pixel spans a fractional number of samples.
     uint8_t scaledRow[PanelWidth];
     for (int x = 0; x < PanelWidth; ++x) {
-        const int left = x * scaler.sourceWidth;
-        const int right = left + scaler.sourceWidth;
+        const int left = x * scaler.cropWidth;
+        const int right = left + scaler.cropWidth;
         unsigned sum = 0;
         for (int sx = left / PanelWidth; sx <= (right - 1) / PanelWidth; ++sx) {
             const int pixelLeft = sx * PanelWidth;
             const int weight = min(right, pixelLeft + PanelWidth) - max(left, pixelLeft);
-            const unsigned shade = gray ? graySample(*row, sx) : luma(scaler.rgb[sx]);
+            const unsigned shade = sampleLuma(*row, scaler.rgb, scaler.cropLeft + sx);
             sum += shade * weight;
         }
-        scaledRow[x] = (sum + scaler.sourceWidth / 2) / scaler.sourceWidth;
+        scaledRow[x] = (sum + scaler.cropWidth / 2) / scaler.cropWidth;
     }
 
     const int sourceTop = row->y * PanelHeight;
@@ -287,7 +329,7 @@ bool renderImage() {
         return false;
     }
 
-    const int opened = png->open(ImagePath, openPng, closePng, readPng, seekPng, makeScaledRow);
+    const int opened = png->open(ImagePath, openPng, closePng, readPng, seekPng, scanSideMargins);
     if (opened != PNG_SUCCESS) {
         input.close();
         Serial.printf("TRMNL PNG open error %d\n", opened);
@@ -300,7 +342,27 @@ bool renderImage() {
         return false;
     }
 
-    PanelScaler scaler(*png, width, height);
+    uint16_t rgb[MaxPngDimension];
+    SideMargins margins(*png, rgb, width);
+    const int scanned = png->decode(&margins, PNG_CHECK_CRC);
+    png->close();
+    if (scanned != PNG_SUCCESS || margins.rows != height) {
+        Serial.printf("TRMNL PNG margin scan error %d (%d rows)\n", scanned, margins.rows);
+        return false;
+    }
+
+    // Limit zoom on sparse screens. A completely white frame has no crop.
+    const int maxTrim = width / 8;
+    const bool hasInk = margins.firstInk < margins.pastLastInk;
+    const int leftTrim = hasInk ? min(maxTrim, margins.firstInk) : 0;
+    const int rightTrim = hasInk ? min(maxTrim, width - margins.pastLastInk) : 0;
+    const int reopened = png->open(ImagePath, openPng, closePng, readPng, seekPng, makeScaledRow);
+    if (reopened != PNG_SUCCESS || png->getWidth() != width || png->getHeight() != height) {
+        input.close();
+        Serial.printf("TRMNL PNG reopen error %d\n", reopened);
+        return false;
+    }
+    PanelScaler scaler(*png, width, height, leftTrim, rightTrim, rgb);
     const int decoded = png->decode(&scaler, PNG_CHECK_CRC);
     png->close();
     if (decoded != PNG_SUCCESS || scaler.sourceRows != height || scaler.outputRows != PanelHeight) {
@@ -328,8 +390,9 @@ bool renderImage() {
     }
     display.endWrite();
     hasFrame = true;
-    Serial.printf("TRMNL FRAME %dx%d -> %dx%d, pixels %08lx\n",
-                  width, height, PanelWidth, PanelHeight, static_cast<unsigned long>(fingerprint));
+    Serial.printf("TRMNL FRAME %dx%d -> %dx%d, trim L%d R%d, pixels %08lx\n",
+                  width, height, PanelWidth, PanelHeight, leftTrim, rightTrim,
+                  static_cast<unsigned long>(fingerprint));
     return true;
 }
 

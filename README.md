@@ -1,6 +1,6 @@
 # TRMNL Mirror for the Sunton ESP32-2432S028R
 
-This firmware turns the 2.8-inch 320 × 240 ILI9341 version of the Sunton ESP32-2432S028R into a mirror of an existing TRMNL. It checks the [TRMNL current-screen API](https://docs.trmnl.com/go/private-api/screens) every 30 seconds. The original device controls its own playlist. The mirror scales the entire grayscale frame to 320 × 240. An 800 × 480 TRMNL frame appears 25% taller than it would at its original aspect ratio. Area-weighted scaling preserves fine lines and text during downsampling.
+This firmware turns the 2.8-inch 320 × 240 ILI9341 version of the Sunton ESP32-2432S028R into a mirror of an existing TRMNL. It checks the [TRMNL current-screen API](https://docs.trmnl.com/go/private-api/screens) every 30 seconds. The original device controls its own playlist. The mirror trims fully white columns on each side by up to one eighth of the source width, then scales the remaining frame to 320 × 240. Area-weighted scaling keeps fine lines and text legible.
 
 The current-screen API uses the original TRMNL's **Device API Key** from **Devices → Edit → Developer Perks**. The original device needs Developer Edition or an existing BYOD license. A separate license for the mirror is unnecessary.
 
